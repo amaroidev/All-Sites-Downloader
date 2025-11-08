@@ -23,6 +23,25 @@ __all__ = [
 LOG = logging.getLogger(__name__)
 
 
+def _friendly_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    lowered = message.lower()
+    if "sign in to confirm you\u2019re not a bot" in lowered or "sign in to confirm you're not a bot" in lowered:
+        return (
+            "YouTube blocked this request and wants verification. Upload a youtube.com cookies.txt file "
+            "under Settings → Cookies and retry after refreshing."
+        )
+    if "this video is private" in lowered:
+        return "This video is private. Ask the uploader for access before downloading."
+    if "members-only" in lowered:
+        return "This video is for channel members only. Sign in with an account that has access."
+    if "premium" in lowered:
+        return "This content requires a paid subscription. Provide cookies from an account with access."
+    if message:
+        return message
+    return "Download failed due to an unknown error."
+
+
 class JobStatus(str, Enum):
     """Stable set of states a download job can be in."""
 
@@ -57,6 +76,7 @@ class DownloadJob:
     eta: int = 0
     error: Optional[str] = None
     metadata: Dict[str, object] = field(default_factory=dict)
+    cookie_file: Optional[Path] = None
     updated_at: datetime = field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
     cancel_requested: bool = False
@@ -287,7 +307,10 @@ class DownloadManager:
         except Exception as exc:  # noqa: BLE001
             with job._lock:
                 job.status = JobStatus.FAILED
-                job.error = str(exc)
+                job.error = _friendly_error_message(exc)
+                job.metadata.setdefault("debug", {})
+                if isinstance(job.metadata["debug"], dict):
+                    job.metadata["debug"].update({"raw_error": str(exc)})
                 job.updated_at = datetime.utcnow()
             LOG.exception("Job %s failed", job_id)
 
@@ -331,4 +354,6 @@ class DownloadManager:
         rate_limit = self._rate_limit
         if rate_limit:
             options["ratelimit"] = rate_limit
+        if job.cookie_file and job.cookie_file.exists():
+            options["cookiefile"] = str(job.cookie_file)
         return options

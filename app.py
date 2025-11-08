@@ -111,6 +111,11 @@ def _configure_app(flask_app: Flask) -> None:
     flask_app.config.setdefault("JOB_RETENTION_HOURS", int(os.getenv("JOB_RETENTION_HOURS", "24")))
     flask_app.config.setdefault("CLEANUP_EVERY_N_REQUESTS", int(os.getenv("CLEANUP_INTERVAL", "20")))
 
+    cookies_dir = Path(os.getenv("COOKIES_ROOT", Path.cwd() / "cookies")).resolve()
+    cookies_dir.mkdir(parents=True, exist_ok=True)
+    flask_app.config.setdefault("COOKIES_ROOT", cookies_dir)
+    flask_app.config.setdefault("COOKIE_MAX_BYTES", int(os.getenv("COOKIE_MAX_BYTES", "262144")))
+
 
 _configure_app(app)
 Session(app)
@@ -252,6 +257,82 @@ def _open_directory_dialog() -> Optional[Path]:
     return Path(selected).expanduser()
 
 
+def _cookies_root() -> Path:
+    root = Path(app.config["COOKIES_ROOT"])
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _cookie_path_for_client(client_id: str) -> Path:
+    safe_id = "".join(ch for ch in client_id if ch.isalnum() or ch in {"-", "_"})
+    if not safe_id:
+        safe_id = "client"
+    root = _cookies_root()
+    return (root / f"{safe_id}.cookies.txt").resolve()
+
+
+def _session_cookie_file() -> Optional[Path]:
+    root = _cookies_root()
+    stored = session.get("cookie_file")
+    if stored:
+        try:
+            candidate = Path(stored).resolve()
+            candidate.relative_to(root)
+        except (OSError, ValueError):
+            candidate = None
+        else:
+            if candidate.exists():
+                return candidate
+
+    client_id = session.get("client_id")
+    if not client_id:
+        return None
+    candidate = _cookie_path_for_client(client_id)
+    if candidate.exists():
+        session["cookie_file"] = str(candidate)
+        session.modified = True
+        return candidate
+    return None
+
+
+def _save_session_cookies(content: bytes) -> Path:
+    data = content.strip()
+    if not data:
+        raise ValueError("Cookie file is empty.")
+
+    max_bytes = int(app.config.get("COOKIE_MAX_BYTES", 262144))
+    if len(data) > max_bytes:
+        raise ValueError("Cookie file is too large.")
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="ignore")
+
+    client_id = _ensure_client_id()
+    path = _cookie_path_for_client(client_id)
+    path.write_text(text, encoding="utf-8")
+    session["cookie_file"] = str(path)
+    session["cookie_uploaded_at"] = datetime.utcnow().isoformat()
+    session.modified = True
+    return path
+
+
+def _clear_session_cookies() -> bool:
+    path = _session_cookie_file()
+    removed = False
+    if path:
+        try:
+            path.unlink(missing_ok=True)
+            removed = True
+        except OSError:
+            LOG.warning("Failed to remove cookie file %s", path, exc_info=True)
+    session.pop("cookie_file", None)
+    session.pop("cookie_uploaded_at", None)
+    session.modified = True
+    return removed
+
+
 @app.before_request
 def _cleanup_downloads() -> None:
     _cleanup_counter["value"] += 1
@@ -285,6 +366,8 @@ def start_download() -> Any:
         cleaned = [str(u).strip() for u in playlist_urls_raw if str(u).strip()]
         playlist_urls = cleaned or None
 
+    client_id = _ensure_client_id()
+    cookie_file = _session_cookie_file()
     download_id = str(uuid.uuid4())
     job = DownloadJob(
         job_id=download_id,
@@ -292,7 +375,8 @@ def start_download() -> Any:
         format_type=format_type,
         format_id=format_id,
         playlist_urls=playlist_urls,
-        requested_by=_ensure_client_id(),
+        requested_by=client_id,
+        cookie_file=cookie_file,
     )
     _download_manager.start_download(job)
     _track_download(download_id)
@@ -481,6 +565,54 @@ def my_downloads() -> Any:
     jobs = [_download_manager.get_job(i) for i in ids]
     jobs = [job for job in jobs if job]
     return jsonify({"downloads": [_job_to_response(job) for job in jobs]})
+
+
+@app.route("/api/cookies/status")
+def cookies_status() -> Any:
+    _ensure_client_id()
+    path = _session_cookie_file()
+    return jsonify(
+        {
+            "enabled": bool(path),
+            "filename": path.name if path else None,
+            "updated_at": session.get("cookie_uploaded_at"),
+        }
+    )
+
+
+@app.route("/api/cookies/upload", methods=["POST"])
+def upload_cookies() -> Any:
+    _ensure_client_id()
+    content: Optional[bytes] = None
+
+    file_storage = request.files.get("file") if request.files else None
+    if file_storage:
+        content = file_storage.read()
+    elif request.is_json:
+        payload = request.get_json(silent=True) or {}
+        raw = payload.get("cookies") if isinstance(payload, dict) else None
+        if isinstance(raw, str):
+            content = raw.encode("utf-8")
+
+    if content is None:
+        return jsonify({"error": "Provide cookies via file upload or JSON 'cookies' field."}), 400
+
+    try:
+        path = _save_session_cookies(content)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        LOG.error("Failed to save cookies", exc_info=True)
+        return jsonify({"error": "Could not save cookies. Try again later."}), 500
+
+    return jsonify({"success": True, "filename": path.name})
+
+
+@app.route("/api/cookies", methods=["DELETE"])
+def delete_cookies() -> Any:
+    _ensure_client_id()
+    removed = _clear_session_cookies()
+    return jsonify({"removed": removed})
 
 
 @app.route("/api/update_yt_dlp", methods=["POST"])

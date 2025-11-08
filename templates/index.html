@@ -310,6 +310,22 @@
                                 </button>
                             </div>
                         </div>
+                        <div class="mb-2">
+                            <label class="form-label d-block">YouTube Cookies:</label>
+                            <div class="d-flex flex-wrap align-items-center gap-2">
+                                <span id="cookiesStatus" class="text-muted small">Not uploaded</span>
+                                <input id="cookieFileInput" type="file" accept=".txt" class="d-none">
+                                <button class="btn btn-outline-primary btn-sm" type="button" onclick="triggerCookieUpload()">
+                                    <i class="fas fa-file-upload"></i> Upload
+                                </button>
+                                <button class="btn btn-outline-danger btn-sm" type="button" onclick="removeStoredCookies()">
+                                    <i class="fas fa-trash"></i> Remove
+                                </button>
+                            </div>
+                            <div class="form-text text-muted">
+                                Upload a cookies.txt exported for youtube.com to bypass sign-in or bot checks.
+                            </div>
+                        </div>
                         <!-- End settings for quality and speed limit -->
                     </div>
                 </div>
@@ -358,6 +374,8 @@
         const downloadStats = document.getElementById('downloadStats');
         const videoInfo = document.getElementById('videoInfo');
         const downloadHistory = document.getElementById('downloadHistory');
+    const cookiesStatus = document.getElementById('cookiesStatus');
+    const cookieFileInput = document.getElementById('cookieFileInput');
 
         // Event Listeners
         downloadBtn.addEventListener('click', async function() {
@@ -370,6 +388,10 @@
         // Load download history on page load
         loadDownloadHistory();
     refreshDownloadDirectory();
+    refreshCookieStatus();
+    if (cookieFileInput) {
+        cookieFileInput.addEventListener('change', handleCookieFileSelected);
+    }
 
         async function refreshDownloadDirectory() {
             try {
@@ -403,6 +425,86 @@
                     display.textContent = path;
                 }
             }
+        }
+
+        async function refreshCookieStatus() {
+            if (!cookiesStatus) return;
+            try {
+                const response = await fetch('/api/cookies/status');
+                if (!response.ok) {
+                    throw new Error('Request failed');
+                }
+                const data = await response.json();
+                updateCookieStatus(data);
+            } catch (error) {
+                console.error('Error fetching cookie status:', error);
+                updateCookieStatus({ enabled: false });
+            }
+        }
+
+        function updateCookieStatus(data) {
+            if (!cookiesStatus) return;
+            if (data && data.enabled) {
+                cookiesStatus.textContent = data.filename ? `Uploaded (${data.filename})` : 'Uploaded';
+                cookiesStatus.classList.remove('text-muted');
+                cookiesStatus.classList.add('text-success');
+            } else {
+                cookiesStatus.textContent = 'Not uploaded';
+                cookiesStatus.classList.add('text-muted');
+                cookiesStatus.classList.remove('text-success');
+            }
+        }
+
+        function triggerCookieUpload() {
+            if (!cookieFileInput) return;
+            cookieFileInput.click();
+        }
+
+        async function handleCookieFileSelected(event) {
+            const input = event.target;
+            if (!input.files || input.files.length === 0) {
+                return;
+            }
+            const file = input.files[0];
+            try {
+                await uploadCookieFile(file);
+                alert('Cookies uploaded successfully. Retry your download.');
+            } catch (error) {
+                alert('Failed to upload cookies: ' + error.message);
+            } finally {
+                input.value = '';
+            }
+        }
+
+        async function uploadCookieFile(file) {
+            const maxSize = 262144; // 256 KB safeguard
+            if (file.size > maxSize) {
+                throw new Error('Cookie file is too large.');
+            }
+            const formData = new FormData();
+            formData.append('file', file);
+            const response = await fetch('/api/cookies/upload', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await response.json();
+            if (!response.ok || data.error) {
+                throw new Error(data.error || 'Upload failed');
+            }
+            await refreshCookieStatus();
+        }
+
+        async function removeStoredCookies() {
+            try {
+                const response = await fetch('/api/cookies', { method: 'DELETE' });
+                const data = await response.json();
+                if (data && data.removed) {
+                    alert('Stored cookies were removed.');
+                }
+            } catch (error) {
+                alert('Failed to remove cookies: ' + error.message);
+            }
+            await refreshCookieStatus();
         }
 
         async function chooseDownloadFolder(options = {}) {
@@ -730,6 +832,8 @@ ${data.directory}`);
                     
                     if (data.completed) {
                         showDownloadComplete();
+                    } else if (data.error) {
+                        showError(data.error);
                     }
                     
                     downloadBtn.disabled = false;
@@ -774,6 +878,10 @@ ${data.directory}`);
                 case 'completed':
                     statusText = 'Download completed!';
                     statusClass = 'text-success';
+                    break;
+                case 'failed':
+                    statusText = `Download failed: ${data.error || 'Unknown error'}`;
+                    statusClass = 'text-danger';
                     break;
                 case 'error':
                     statusText = `Error: ${data.error}`;
