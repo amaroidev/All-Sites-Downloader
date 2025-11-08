@@ -30,6 +30,13 @@ A powerful, modern web application for downloading videos from YouTube, Instagra
   - Thumbnail, title, duration, views
   - Multiple format options
 
+- **Revamped Architecture**: 
+  - Improved download management with threading
+  - Better error handling and retry logic
+  - Session-based user tracking
+  - Configurable rate limiting
+  - Automatic cleanup of old downloads
+
 ## 🛠️ Installation
 
 ### Quick Start (Windows)

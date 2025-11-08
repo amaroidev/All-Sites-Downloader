@@ -1,815 +1,592 @@
-import os
-import uuid
+from __future__ import annotations
+
+import csv
+import io
 import json
-import threading
-from datetime import datetime, timedelta
-from flask import Flask, render_template, request, jsonify, send_file, session
-from flask_session import Session
-import yt_dlp
-from render_fixes import enhanced_yt_dlp_options  # Import the enhanced options
-from urllib.parse import urlparse
-import re
+import logging
+import mimetypes
+import os
+import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
-import requests
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from oauth2client.service_account import ServiceAccountCredentials
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+from flask import Flask, jsonify, render_template, request, send_file, session
+from flask_session import Session
+from werkzeug.exceptions import BadRequest, NotFound
+
+import yt_dlp
+
+from downloader import DownloadJob, DownloadManager, JobStatus
+
+try:  # Optional Google Drive dependencies
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    from oauth2client.service_account import ServiceAccountCredentials
+
+    HAS_GOOGLE_DRIVE = True
+except Exception:  # noqa: BLE001
+    HAS_GOOGLE_DRIVE = False
+
+
+LOG = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-change-this'
-app.config['SESSION_TYPE'] = 'filesystem'
-app.config['SESSION_PERMANENT'] = False
-app.config['SESSION_USE_SIGNER'] = True
+
+
+def _configure_app(flask_app: Flask) -> None:
+    """Populate default configuration from environment variables."""
+
+    flask_app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production-123456789")
+    flask_app.config.setdefault("SESSION_TYPE", os.getenv("SESSION_TYPE", "filesystem"))
+    flask_app.config.setdefault("SESSION_PERMANENT", False)
+    flask_app.config.setdefault("SESSION_USE_SIGNER", True)
+
+    session_dir = Path(os.getenv("SESSION_FILE_DIR", Path.cwd() / "flask_session")).resolve()
+    session_dir.mkdir(parents=True, exist_ok=True)
+    flask_app.config.setdefault("SESSION_FILE_DIR", str(session_dir))
+
+    download_root = Path(os.getenv("DOWNLOAD_FOLDER", Path.cwd() / "downloads")).resolve()
+    download_root.mkdir(parents=True, exist_ok=True)
+    flask_app.config.setdefault("DOWNLOAD_ROOT", download_root)
+
+    flask_app.config.setdefault("MAX_CONCURRENT_DOWNLOADS", int(os.getenv("MAX_DOWNLOADS", "4")))
+    flask_app.config.setdefault("JOB_RETENTION_HOURS", int(os.getenv("JOB_RETENTION_HOURS", "24")))
+    flask_app.config.setdefault("CLEANUP_EVERY_N_REQUESTS", int(os.getenv("CLEANUP_INTERVAL", "20")))
+
+
+_configure_app(app)
 Session(app)
 
-# Track application start time for uptime calculations
+mimetypes.init()
+logging.basicConfig(level=logging.INFO)
+
+_download_manager = DownloadManager(
+    download_root=app.config["DOWNLOAD_ROOT"],
+    max_workers=app.config["MAX_CONCURRENT_DOWNLOADS"],
+    retention_hours=app.config["JOB_RETENTION_HOURS"],
+)
+
+_cleanup_counter = {"value": 0}
 app.start_time = time.time()
 
-# Global storage for download progress
-download_progress = {}
-download_history = {}
-download_threads = {}
 
-DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+def _require_json(*required_keys: str) -> Dict[str, Any]:
+    if not request.is_json:
+        raise BadRequest("Request must include a JSON body.")
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        raise BadRequest("Invalid JSON payload.")
+    for key in required_keys:
+        if not payload.get(key):
+            raise BadRequest(f"{key} is required.")
+    return payload
 
-class DownloadProgress:
-    def __init__(self, download_id):
-        self.download_id = download_id
-        self.status = 'preparing'
-        self.progress = 0
-        self.filename = ''
-        self.filesize = 0
-        self.downloaded = 0
-        self.speed = 0
-        self.eta = 0
-        self.error = None
-        self.completed = False
-        self.file_path = None
 
-def progress_hook(d, download_id):
-    if download_id not in download_progress:
-        return
-    
-    progress_obj = download_progress[download_id]
-    
-    if d['status'] == 'downloading':
-        progress_obj.status = 'downloading'
-        progress_obj.filename = d.get('filename', 'Unknown')
-        
-        if 'total_bytes' in d:
-            progress_obj.filesize = d['total_bytes']
-            progress_obj.downloaded = d['downloaded_bytes']
-            progress_obj.progress = (d['downloaded_bytes'] / d['total_bytes']) * 100
-        elif 'total_bytes_estimate' in d:
-            progress_obj.filesize = d['total_bytes_estimate']
-            progress_obj.downloaded = d['downloaded_bytes']
-            progress_obj.progress = (d['downloaded_bytes'] / d['total_bytes_estimate']) * 100
-        
-        progress_obj.speed = d.get('speed', 0)
-        progress_obj.eta = d.get('eta', 0)
-        
-    elif d['status'] == 'finished':
-        progress_obj.status = 'completed'
-        progress_obj.progress = 100
-        progress_obj.completed = True
-        progress_obj.file_path = d['filename']
-        progress_obj.filename = os.path.basename(d['filename'])
+def _job_or_404(download_id: str) -> DownloadJob:
+    job = _download_manager.get_job(download_id)
+    if not job:
+        raise NotFound(f"Download {download_id} not found.")
+    return job
 
-executor = ThreadPoolExecutor(max_workers=5)  # Allow up to 5 parallel downloads
 
-def download_video(url, download_id, format_type='best', max_retries=3, retry_delay=5):
-    """
-    Download a video with automatic retry functionality
-    
-    Args:
-        url: URL to download
-        download_id: Unique ID for tracking the download
-        format_type: Format to download (video or audio)
-        max_retries: Maximum number of retry attempts
-        retry_delay: Delay between retries in seconds
-    """
-    retry_count = 0
-    progress_obj = download_progress[download_id]
-    
-    while retry_count <= max_retries:
-        try:
-            # Use a clean, readable filename template
-            ydl_opts = {
-                'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'),
-                'progress_hooks': [lambda d: progress_hook(d, download_id)],
-                'extractaudio': format_type == 'audio',
-                'audioformat': 'mp3' if format_type == 'audio' else None,
-                'format': 'bestaudio/best' if format_type == 'audio' else 'bestvideo+bestaudio/best',
-                'merge_output_format': 'mp4' if format_type == 'video' else None,
-                'quiet': False,
-                'no_warnings': False,
-                'ignoreerrors': True,
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['web', 'android', 'mweb', 'tv_embedded'],
-                        'player_skip': ['webpage', 'configs'],
-                    }
-                },
-                'cookiesfrombrowser': ('chrome',),  # Try to use browser cookies
-                'cookiefile': 'cookies.txt',  # Fallback cookie file
-                'geo_bypass': True,  # Try to bypass geo-restrictions
-                'geo_verification_proxy': None,  # Don't use proxy for verification
-                'socket_timeout': 30,  # Increase timeout
-                'retries': 10,  # Increase retries
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                progress_obj.status = 'extracting_info'
-                try:
-                    # First try to get video info without downloading
-                    info = ydl.extract_info(url, download=False)
-                    if info is None:
-                        raise Exception("Could not extract video information")
-                    
-                    # Verify video is available
-                    if info.get('_type') == 'playlist':
-                        entries = info.get('entries', [])
-                        if not entries:
-                            raise Exception("Playlist is empty or unavailable")
-                        info = entries[0]  # Get first video from playlist
-                    
-                    if not info.get('id'):
-                        raise Exception("Video ID not found")
-                    
-                    # Store video info
-                    progress_obj.title = info.get('title', 'Unknown')
-                    progress_obj.duration = info.get('duration', 0)
-                    progress_obj.uploader = info.get('uploader', 'Unknown')
-                    progress_obj.view_count = info.get('view_count', 0)
-                    
-                    # Start download
-                    progress_obj.status = 'starting_download'
-                    result = ydl.download([url])
-                    
-                    # After download, find the actual file path
-                    info = ydl.extract_info(url, download=False)
-                    ext = info.get('ext', 'mp4')
-                    safe_title = info.get('title', 'video')
-                    filename = f"{safe_title}.{ext}"
-                    file_path = os.path.join(DOWNLOAD_FOLDER, filename)
-                    progress_obj.file_path = file_path
-                    progress_obj.filename = filename
+def _ensure_client_id() -> str:
+    client_id = session.get("client_id")
+    if not client_id:
+        client_id = str(uuid.uuid4())
+        session["client_id"] = client_id
+        session.modified = True
+    return client_id
 
-                    # If we get here without exception, download was successful
-                    return
-                except Exception as e:
-                    if "Video unavailable" in str(e) or "content isn't available" in str(e):
-                        # Try alternative extraction method with different options
-                        ydl_opts['extractor_args']['youtube']['player_client'] = ['mweb', 'web', 'android']
-                        ydl_opts['geo_bypass'] = True
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
-                            try:
-                                info = ydl2.extract_info(url, download=False)
-                                if info is None:
-                                    raise Exception("Video is unavailable or restricted")
-                                # Continue with download...
-                            except Exception as e2:
-                                # If second attempt fails, try one more time with different options
-                                ydl_opts['extractor_args']['youtube']['player_client'] = ['tv_embedded', 'web']
-                                with yt_dlp.YoutubeDL(ydl_opts) as ydl3:
-                                    info = ydl3.extract_info(url, download=False)
-                                    if info is None:
-                                        raise Exception("Video is unavailable or restricted")
-                    else:
-                        raise e
-                
-        except Exception as e:
-            retry_count += 1
-            progress_obj.status = 'retrying' if retry_count <= max_retries else 'error'
-            progress_obj.error = f"Error: {str(e)}" + (f" (Retry {retry_count}/{max_retries})" if retry_count <= max_retries else "")
-            
-            # If we still have retries left, wait and then retry
-            if retry_count <= max_retries:
-                time.sleep(retry_delay)
-                # Increase delay for each retry (exponential backoff)
-                retry_delay *= 1.5
-            else:
-                # Final failure
-                progress_obj.error = f"Failed after {max_retries} retries: {str(e)}"
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+def _track_download(download_id: str) -> None:
+    downloads = session.setdefault("downloads", [])
+    if download_id not in downloads:
+        downloads.append(download_id)
+        session.modified = True
 
-@app.route('/api/start_download', methods=['POST'])
-def start_download():
-    data = request.get_json()
-    url = data.get('url')
-    format_type = data.get('format', 'video')
-    format_id = data.get('format_id')
-    playlist_urls = data.get('playlist_urls')
-    
+
+def _session_download_ids() -> List[str]:
+    downloads = session.get("downloads", [])
+    return [d for d in downloads if isinstance(d, str)]
+
+
+def _job_to_response(job: DownloadJob) -> Dict[str, Any]:
+    data = job.to_dict()
+    data["metadata"] = job.metadata
+    return data
+
+
+def _guess_mimetype(filename: str) -> str:
+    mimetype, _ = mimetypes.guess_type(filename)
+    return mimetype or "application/octet-stream"
+
+
+def _aggregate_stats(jobs: Iterable[DownloadJob]) -> Dict[str, Any]:
+    total_downloaded = sum(job.downloaded for job in jobs if job.downloaded)
+    active = [job for job in jobs if job.status in {JobStatus.QUEUED, JobStatus.PREPARING, JobStatus.DOWNLOADING}]
+    completed = [job for job in jobs if job.status == JobStatus.COMPLETED]
+    failed = [job for job in jobs if job.status == JobStatus.FAILED]
+    average_speed = 0.0
+    speeds = [job.speed for job in jobs if job.speed]
+    if speeds:
+        average_speed = sum(speeds) / len(speeds)
+    return {
+        "total_downloads": len(list(jobs)),
+        "active_downloads": len(active),
+        "completed_downloads": len(completed),
+        "failed_downloads": len(failed),
+        "total_downloaded_bytes": total_downloaded,
+        "average_speed": average_speed,
+        "server_uptime": int(time.time() - app.start_time),
+    }
+
+
+@app.before_request
+def _cleanup_downloads() -> None:
+    _cleanup_counter["value"] += 1
+    if _cleanup_counter["value"] % app.config["CLEANUP_EVERY_N_REQUESTS"] == 0:
+        _download_manager.cleanup_expired()
+
+
+@app.route("/")
+def index() -> str:
+    _ensure_client_id()
+    return render_template("index.html")
+
+
+@app.route("/api/start_download", methods=["POST"])
+def start_download() -> Any:
+    payload = _require_json("url")
+    url = str(payload["url"]).strip()
     if not url:
-        return jsonify({'error': 'URL is required'}), 400
-    
-    # Generate unique download ID
+        raise BadRequest("URL is required.")
+
+    format_type = str(payload.get("format", "video")).lower()
+    if format_type not in {"video", "audio"}:
+        format_type = "video"
+
+    format_id = payload.get("format_id")
+    playlist_urls_raw = payload.get("playlist_urls")
+    playlist_urls: Optional[List[str]] = None
+    if isinstance(playlist_urls_raw, list):
+        cleaned = [str(u).strip() for u in playlist_urls_raw if str(u).strip()]
+        playlist_urls = cleaned or None
+
     download_id = str(uuid.uuid4())
-    
-    # Initialize progress tracking
-    download_progress[download_id] = DownloadProgress(download_id)
-    
-    def run_download():
-        progress_obj = download_progress[download_id]
-        # Base yt-dlp options
-        base_opts = {
-            'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s'),
-            'progress_hooks': [lambda d: progress_hook(d, download_id)],
-        }
-        # Use the enhanced options for better cloud compatibility
-        ydl_opts = enhanced_yt_dlp_options(base_opts, format_id, format_type)
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                if playlist_urls:
-                    for u in playlist_urls:
-                        ydl.download([u])
-                else:
-                    ydl.download([url])
-        except Exception as e:
-            progress_obj.status = 'error'
-            progress_obj.error = str(e)
-    thread = threading.Thread(target=run_download)
-    thread.start()
-    download_threads[download_id] = thread
-    
-    # Store in session for user tracking
-    if 'downloads' not in session:
-        session['downloads'] = []
-    session['downloads'].append(download_id)
-    
-    return jsonify({'download_id': download_id})
+    job = DownloadJob(
+        job_id=download_id,
+        url=url,
+        format_type=format_type,
+        format_id=format_id,
+        playlist_urls=playlist_urls,
+        requested_by=_ensure_client_id(),
+    )
+    _download_manager.start_download(job)
+    _track_download(download_id)
+    return jsonify({"download_id": download_id, "job": _job_to_response(job)}), 202
 
-@app.route('/api/progress/<download_id>')
-def get_progress(download_id):
-    if download_id not in download_progress:
-        return jsonify({'error': 'Download not found'}), 404
-    
-    progress_obj = download_progress[download_id]
-    
-    return jsonify({
-        'status': progress_obj.status,
-        'progress': progress_obj.progress,
-        'filename': progress_obj.filename,
-        'filesize': progress_obj.filesize,
-        'downloaded': progress_obj.downloaded,
-        'speed': progress_obj.speed,
-        'eta': progress_obj.eta,
-        'error': progress_obj.error,
-        'completed': progress_obj.completed,
-        'title': getattr(progress_obj, 'title', ''),
-        'duration': getattr(progress_obj, 'duration', 0),
-        'uploader': getattr(progress_obj, 'uploader', ''),
-        'view_count': getattr(progress_obj, 'view_count', 0)
-    })
 
-@app.route('/api/download_file/<download_id>')
-def download_file(download_id):
-    if download_id not in download_progress:
-        return jsonify({'error': 'Download not found'}), 404
-    
-    progress_obj = download_progress[download_id]
-    
-    if not progress_obj.completed or not progress_obj.file_path:
-        return jsonify({'error': 'Download not completed'}), 400
-    
-    if not os.path.exists(progress_obj.file_path):
-        return jsonify({'error': 'File not found'}), 404
-    
-    # Guess MIME type based on extension
-    ext = os.path.splitext(progress_obj.filename)[1].lower()
-    mimetype = 'application/octet-stream'
-    if ext == '.mp4':
-        mimetype = 'video/mp4'
-    elif ext == '.mp3':
-        mimetype = 'audio/mpeg'
-    elif ext == '.webm':
-        mimetype = 'video/webm'
-    elif ext == '.m4a':
-        mimetype = 'audio/mp4'
-    elif ext == '.wav':
-        mimetype = 'audio/wav'
-    elif ext == '.aac':
-        mimetype = 'audio/aac'
-    elif ext == '.flac':
-        mimetype = 'audio/flac'
-    
+@app.route("/api/progress/<download_id>")
+def download_progress(download_id: str) -> Any:
+    job = _job_or_404(download_id)
+    return jsonify(_job_to_response(job))
+
+
+@app.route("/api/download_file/<download_id>")
+def download_file(download_id: str):
+    job = _job_or_404(download_id)
+    if job.status != JobStatus.COMPLETED or not job.file_path:
+        raise BadRequest("Download not completed yet.")
+    if not job.file_path.exists():
+        raise NotFound("File not found on server.")
     return send_file(
-        progress_obj.file_path,
+        job.file_path,
         as_attachment=True,
-        download_name=progress_obj.filename,
-        mimetype=mimetype
+        download_name=job.filename or job.file_path.name,
+        mimetype=_guess_mimetype(job.filename),
     )
 
-@app.route('/api/supported_sites')
-def supported_sites():
-    """Get list of supported sites from yt-dlp"""
-    try:
-        with yt_dlp.YoutubeDL() as ydl:
-            extractors = ydl.list_extractors()
-            # Get popular sites
-            popular_sites = [
-                'youtube', 'twitter', 'instagram', 'tiktok', 'facebook',
-                'vimeo', 'dailymotion', 'twitch', 'reddit', 'pinterest',
-                'linkedin', 'soundcloud', 'spotify', 'bandcamp'
-            ]
-            
-            supported = []
-            for extractor in extractors:
-                name = extractor.IE_NAME.lower()
-                if any(site in name for site in popular_sites):
-                    supported.append({
-                        'name': extractor.IE_NAME,
-                        'description': getattr(extractor, 'IE_DESC', ''),
-                        'website': name
-                    })
-            
-            return jsonify({'sites': supported[:50]})  # Return top 50
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/video_info', methods=['POST'])
-def video_info():
-    data = request.get_json()
-    url = data.get('url')
-    if not url:
-        return jsonify({'error': 'No URL provided'}), 400
-    
-    # Base yt-dlp options
-    base_opts = {'quiet': True, 'skip_download': True}
-    # Use the enhanced options for better cloud compatibility
-    ydl_opts = enhanced_yt_dlp_options(base_opts)
-    
+@app.route("/api/supported_sites")
+def supported_sites() -> Any:
+    cache_key = "supported_sites_cache"
+    cached = app.config.get(cache_key)
+    if cached and cached["expires_at"] > time.time():
+        return jsonify(cached["payload"])
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            # For playlists, info['entries'] is a list of video dicts
-            formats = info.get('formats', [])
-            format_list = [
+        extractors = yt_dlp.list_extractors()
+    except Exception as exc:  # noqa: BLE001
+        raise BadRequest(str(exc)) from exc
+
+    popular = {
+        "youtube",
+        "twitter",
+        "instagram",
+        "tiktok",
+        "facebook",
+        "vimeo",
+        "dailymotion",
+        "twitch",
+        "reddit",
+        "pinterest",
+        "linkedin",
+        "soundcloud",
+        "bandcamp",
+    }
+
+    sites = []
+    for extractor in extractors:
+        name = extractor.IE_NAME.lower()
+        if any(p in name for p in popular):
+            sites.append(
                 {
-                    'format_id': f.get('format_id'),
-                    'format_note': f.get('format_note'),
-                    'resolution': f.get('resolution'),
-                    'ext': f.get('ext'),
-                    'filesize': f.get('filesize'),
-                    'vcodec': f.get('vcodec'),
-                    'acodec': f.get('acodec'),
-                    'fps': f.get('fps'),
-                    'abr': f.get('abr')
-                } for f in formats
-            ]
-            entries = []
-            if 'entries' in info and info['entries']:
-                for entry in info['entries']:
-                    entries.append({
-                        'title': entry.get('title'),
-                        'url': entry.get('webpage_url') or entry.get('url')
-                    })
-            return jsonify({
-                'title': info.get('title'),
-                'uploader': info.get('uploader'),
-                'duration': info.get('duration'),
-                'view_count': info.get('view_count'),
-                'description': info.get('description'),
-                'website': info.get('extractor_key'),
-                'thumbnail': info.get('thumbnail'),
-                'formats': format_list,
-                'entries': entries,
-                'subtitles': info.get('subtitles', {})
-            })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+                    "name": extractor.IE_NAME,
+                    "description": getattr(extractor, "IE_DESC", ""),
+                }
+            )
+        if len(sites) >= 50:
+            break
 
-@app.route('/api/my_downloads')
-def my_downloads():
-    """Get user's download history"""
-    if 'downloads' not in session:
-        return jsonify({'downloads': []})
-    
-    downloads = []
-    for download_id in session['downloads']:
-        if download_id in download_progress:
-            progress_obj = download_progress[download_id]
-            downloads.append({
-                'id': download_id,
-                'status': progress_obj.status,
-                'filename': progress_obj.filename,
-                'title': getattr(progress_obj, 'title', ''),
-                'completed': progress_obj.completed,
-                'error': progress_obj.error
-            })
-    
-    return jsonify({'downloads': downloads})
+    payload = {"sites": sites}
+    app.config[cache_key] = {"payload": payload, "expires_at": time.time() + 3600}
+    return jsonify(payload)
 
-@app.route('/api/update_yt_dlp', methods=['POST'])
-def update_yt_dlp():
-    """Check and update yt-dlp to the latest version."""
+
+@app.route("/api/video_info", methods=["POST"])
+def video_info() -> Any:
+    payload = _require_json("url")
+    url = str(payload["url"]).strip()
+    options = {"quiet": True, "skip_download": True}
     try:
-        result = os.system('pip install -U yt-dlp')
-        if result == 0:
-            return jsonify({'message': 'yt-dlp updated successfully'}), 200
-        else:
-            return jsonify({'error': 'Failed to update yt-dlp'}), 500
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/upload_to_drive', methods=['POST'])
-def upload_to_drive():
-    """Upload a downloaded file to Google Drive."""
-    data = request.get_json()
-    download_id = data.get('download_id')
-
-    if download_id not in download_progress:
-        return jsonify({'error': 'Download not found'}), 404
-
-    progress_obj = download_progress[download_id]
-
-    if not progress_obj.completed or not progress_obj.file_path:
-        return jsonify({'error': 'Download not completed'}), 400
-
-    try:
-        # Google Drive API setup
-        SCOPES = ['https://www.googleapis.com/auth/drive.file']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', SCOPES)
-        service = build('drive', 'v3', credentials=creds)
-
-        # Upload file
-        file_metadata = {'name': progress_obj.filename}
-        media = MediaFileUpload(progress_obj.file_path, resumable=True)
-        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-
-        return jsonify({'message': 'File uploaded to Google Drive', 'file_id': file.get('id')}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/download_subtitles', methods=['POST'])
-def download_subtitles():
-    """Download subtitles for a video."""
-    data = request.get_json()
-    url = data.get('url')
-    language = data.get('language', 'en')
-
-    if not url:
-        return jsonify({'error': 'URL is required'}), 400
-
-    try:
-        ydl_opts = {
-            'writesubtitles': True,
-            'subtitleslangs': [language],
-            'skip_download': True,
-            'outtmpl': os.path.join(DOWNLOAD_FOLDER, '%(title)s.%(ext)s')
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
-            return jsonify({'message': 'Subtitles downloaded', 'title': info.get('title')}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception as exc:  # noqa: BLE001
+        raise BadRequest(str(exc)) from exc
 
-@app.route('/api/convert_audio', methods=['POST'])
-def convert_audio():
-    """Convert a downloaded video to a specific audio format."""
-    data = request.get_json()
-    download_id = data.get('download_id')
-    audio_format = data.get('format', 'mp3')
+    formats = [
+        {
+            "format_id": fmt.get("format_id"),
+            "format_note": fmt.get("format_note"),
+            "resolution": fmt.get("resolution"),
+            "ext": fmt.get("ext"),
+            "filesize": fmt.get("filesize"),
+            "vcodec": fmt.get("vcodec"),
+            "acodec": fmt.get("acodec"),
+            "fps": fmt.get("fps"),
+            "abr": fmt.get("abr"),
+        }
+        for fmt in info.get("formats", [])
+    ]
 
-    if download_id not in download_progress:
-        return jsonify({'error': 'Download not found'}), 404
+    entries = []
+    for entry in info.get("entries", []) or []:
+        entries.append({"title": entry.get("title"), "url": entry.get("webpage_url") or entry.get("url")})
 
-    progress_obj = download_progress[download_id]
+    return jsonify(
+        {
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "duration": info.get("duration"),
+            "view_count": info.get("view_count"),
+            "description": info.get("description"),
+            "website": info.get("extractor_key"),
+            "thumbnail": info.get("thumbnail"),
+            "formats": formats,
+            "entries": entries,
+            "subtitles": info.get("subtitles", {}),
+        }
+    )
 
-    if not progress_obj.completed or not progress_obj.file_path:
-        return jsonify({'error': 'Download not completed'}), 400
+
+@app.route("/api/my_downloads")
+def my_downloads() -> Any:
+    ids = _session_download_ids()
+    jobs = [_download_manager.get_job(i) for i in ids]
+    jobs = [job for job in jobs if job]
+    return jsonify({"downloads": [_job_to_response(job) for job in jobs]})
+
+
+@app.route("/api/update_yt_dlp", methods=["POST"])
+def update_yt_dlp() -> Any:
+    result = subprocess.run(
+        ["python", "-m", "pip", "install", "--upgrade", "yt-dlp"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        LOG.error("yt-dlp update failed: %s", result.stderr)
+        return jsonify({"error": result.stderr.strip() or "Failed to update yt-dlp"}), 500
+    return jsonify({"message": result.stdout.strip() or "yt-dlp updated"})
+
+
+@app.route("/api/upload_to_drive", methods=["POST"])
+def upload_to_drive() -> Any:
+    if not HAS_GOOGLE_DRIVE:
+        return jsonify({"error": "Google Drive support is not available."}), 503
+
+    payload = _require_json("download_id")
+    job = _job_or_404(payload["download_id"])
+    if job.status != JobStatus.COMPLETED or not job.file_path:
+        raise BadRequest("Download must be completed before upload.")
+
+    credentials_path = Path("credentials.json")
+    if not credentials_path.exists():
+        raise BadRequest("credentials.json file not found for Google Drive upload.")
 
     try:
-        output_file = os.path.splitext(progress_obj.file_path)[0] + f'.{audio_format}'
-        os.system(f'ffmpeg -i "{progress_obj.file_path}" "{output_file}"')
+        scopes = ["https://www.googleapis.com/auth/drive.file"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(str(credentials_path), scopes)
+        service = build("drive", "v3", credentials=creds)
+        metadata = {"name": job.filename or job.file_path.name}
+        media = MediaFileUpload(str(job.file_path), resumable=True)
+        created = service.files().create(body=metadata, media_body=media, fields="id").execute()
+    except Exception as exc:  # noqa: BLE001
+        raise BadRequest(str(exc)) from exc
 
-        return jsonify({'message': 'Audio converted', 'output_file': output_file}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    return jsonify({"message": "File uploaded to Google Drive", "file_id": created.get("id")})
 
-@app.route('/api/drag_and_drop', methods=['POST'])
-def drag_and_drop():
-    """Handle drag-and-drop URL input with rate limiting"""
-    data = request.get_json()
-    urls = data.get('urls', [])
 
-    if not urls:
-        return jsonify({'error': 'No URLs provided'}), 400
+@app.route("/api/download_subtitles", methods=["POST"])
+def download_subtitles() -> Any:
+    payload = _require_json("url")
+    language = str(payload.get("language", "en"))
+    options = {
+        "writesubtitles": True,
+        "subtitleslangs": [language],
+        "skip_download": True,
+        "outtmpl": str(app.config["DOWNLOAD_ROOT"] / "%(title)s.%(ext)s"),
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(payload["url"], download=False)
+    except Exception as exc:  # noqa: BLE001
+        raise BadRequest(str(exc)) from exc
+    return jsonify({"message": "Subtitles processed", "title": info.get("title")})
 
-    # Limit to 10 URLs at a time to prevent overload
-    if len(urls) > 10:
-        urls = urls[:10]
 
+@app.route("/api/convert_audio", methods=["POST"])
+def convert_audio() -> Any:
+    payload = _require_json("download_id")
+    audio_format = str(payload.get("format", "mp3")).lower()
+    job = _job_or_404(payload["download_id"])
+    if job.status != JobStatus.COMPLETED or not job.file_path:
+        raise BadRequest("Download must be completed before conversion.")
+
+    target = job.file_path.with_suffix(f".{audio_format}")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(job.file_path),
+        str(target),
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        LOG.error("ffmpeg conversion failed: %s", result.stderr)
+        return jsonify({"error": result.stderr.strip() or "Conversion failed"}), 500
+    return jsonify({"message": "Audio converted", "output_file": str(target)}), 200
+
+
+@app.route("/api/drag_and_drop", methods=["POST"])
+def drag_and_drop() -> Any:
+    payload = _require_json("urls")
+    urls = payload.get("urls")
+    if not isinstance(urls, list) or not urls:
+        raise BadRequest("urls must be a non-empty list")
+
+    limit = min(len(urls), 10)
     responses = []
-    
-    # Use rate limiting for batch downloads
-    delay_seconds = 0
-    for url in urls:
+    for url in urls[:limit]:
+        if not url:
+            continue
         download_id = str(uuid.uuid4())
-        download_progress[download_id] = DownloadProgress(download_id)
-        
-        # Schedule with a delay for rate limiting
-        threading.Timer(delay_seconds, lambda u=url, d=download_id: executor.submit(download_video, u, d)).start()
-        
-        # Add 2 seconds delay between each download to prevent overload
-        delay_seconds += 2
-        
-        responses.append({
-            'url': url, 
-            'download_id': download_id,
-            'estimated_start_time': delay_seconds
-        })
-        
-        # Add to user session
-        if 'downloads' not in session:
-            session['downloads'] = []
-        session['downloads'].append(download_id)
+        job = DownloadJob(
+            job_id=download_id,
+            url=str(url).strip(),
+            format_type="video",
+            requested_by=_ensure_client_id(),
+        )
+        _download_manager.start_download(job)
+        _track_download(download_id)
+        responses.append({"url": url, "download_id": download_id})
 
-    return jsonify({
-        'message': f'Processing {len(urls)} URLs with rate limiting',
-        'downloads': responses
-    }), 200
+    return jsonify({"message": f"Processing {len(responses)} URLs", "downloads": responses})
 
-@app.route('/api/set_speed_limit', methods=['POST'])
-def set_speed_limit():
-    """Set a download speed limit."""
-    data = request.get_json()
-    speed_limit = data.get('speed_limit')
-    
-    if not speed_limit:
-        return jsonify({'error': 'Speed limit is required'}), 400
-    
+
+@app.route("/api/set_speed_limit", methods=["POST"])
+def set_speed_limit() -> Any:
+    payload = _require_json("speed_limit")
     try:
-        # Parse to integer KB/s
-        speed_limit_int = int(speed_limit)
-        
-        # Update the default options for yt-dlp
-        os.environ['YDL_RATE_LIMIT'] = str(speed_limit_int)
-        
-        return jsonify({
-            'message': f'Speed limit set to {speed_limit_int} KB/s',
-            'speed_limit': speed_limit_int
-        }), 200
-    except ValueError:
-        return jsonify({'error': 'Speed limit must be a valid number'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        limit_kb = int(payload["speed_limit"])
+    except (TypeError, ValueError) as exc:
+        raise BadRequest("speed_limit must be numeric") from exc
+    if limit_kb <= 0:
+        _download_manager.set_rate_limit(None)
+        return jsonify({"message": "Speed limit disabled"})
+    _download_manager.set_rate_limit(limit_kb)
+    return jsonify({"message": f"Speed limit set to {limit_kb} KB/s"})
 
-@app.route('/api/export_history_json')
-def export_history_json():
-    """Export download history as JSON"""
-    if 'downloads' not in session:
-        return jsonify({'error': 'No download history found'}), 404
-    
-    history = []
-    for download_id in session['downloads']:
-        if download_id in download_progress:
-            progress_obj = download_progress[download_id]
-            history.append({
-                'id': download_id,
-                'title': getattr(progress_obj, 'title', ''),
-                'uploader': getattr(progress_obj, 'uploader', ''),
-                'status': progress_obj.status,
-                'filename': progress_obj.filename,
-                'filesize': progress_obj.filesize,
-                'progress': progress_obj.progress,
-                'completed': progress_obj.completed,
-                'error': progress_obj.error,
-                'download_time': datetime.now().isoformat()
-            })
-    
-    # Create a response with JSON content
+
+def _jobs_from_session() -> List[DownloadJob]:
+    jobs = []
+    for download_id in _session_download_ids():
+        job = _download_manager.get_job(download_id)
+        if job:
+            jobs.append(job)
+    return jobs
+
+
+@app.route("/api/export_history_json")
+def export_history_json() -> Any:
+    jobs = _jobs_from_session()
+    history = [_job_to_response(job) for job in jobs]
     response = app.response_class(
-        response=json.dumps(history, indent=4),
-        status=200,
-        mimetype='application/json'
+        response=json.dumps(history, indent=2),
+        mimetype="application/json",
     )
     response.headers["Content-Disposition"] = "attachment; filename=download_history.json"
     return response
 
-@app.route('/api/export_history_csv')
-def export_history_csv():
-    """Export download history as CSV"""
-    if 'downloads' not in session:
-        return jsonify({'error': 'No download history found'}), 404
-    
-    # Create CSV content
-    csv_content = "id,title,uploader,status,filename,filesize,progress,completed,error\n"
-    for download_id in session['downloads']:
-        if download_id in download_progress:
-            progress_obj = download_progress[download_id]
-            # Escape double quotes in fields for CSV format
-            title = getattr(progress_obj, "title", "").replace('"', '""')
-            uploader = getattr(progress_obj, "uploader", "").replace('"', '""')
-            error_msg = str(progress_obj.error).replace('"', '""') if progress_obj.error else ""
-            
-            csv_content += f'"{download_id}","{title}","{uploader}","{progress_obj.status}","{progress_obj.filename}","{progress_obj.filesize}","{progress_obj.progress}","{progress_obj.completed}","{error_msg}"\n'
-    
-    # Create a response with CSV content
-    response = app.response_class(
-        response=csv_content,
-        status=200,
-        mimetype='text/csv'
+
+@app.route("/api/export_history_csv")
+def export_history_csv() -> Any:
+    jobs = _jobs_from_session()
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "id",
+            "title",
+            "filename",
+            "status",
+            "filesize",
+            "progress",
+            "completed",
+            "error",
+        ],
     )
+    writer.writeheader()
+    for job in jobs:
+        data = _job_to_response(job)
+        writer.writerow(
+            {
+                "id": data["id"],
+                "title": data["metadata"].get("title"),
+                "filename": data.get("filename"),
+                "status": data.get("status"),
+                "filesize": data.get("filesize"),
+                "progress": data.get("progress"),
+                "completed": data.get("completed"),
+                "error": data.get("error"),
+            }
+        )
+    response = app.response_class(response=buffer.getvalue(), mimetype="text/csv")
     response.headers["Content-Disposition"] = "attachment; filename=download_history.csv"
     return response
 
-@app.route('/api/system_stats')
-def system_stats():
-    """Get system statistics"""
-    stats = {
-        'total_downloads': len(session.get('downloads', [])),
-        'active_downloads': len([d for d in download_progress.values() if d.status == 'downloading']),
-        'completed_downloads': len([d for d in download_progress.values() if d.status == 'completed']),
-        'failed_downloads': len([d for d in download_progress.values() if d.status == 'error']),
-        'total_downloaded_bytes': sum(d.filesize for d in download_progress.values() if d.completed),
-        'average_speed': sum(d.speed for d in download_progress.values() if d.speed) / max(1, len([d for d in download_progress.values() if d.speed])),
-        'server_uptime': int(time.time() - app.start_time) if hasattr(app, 'start_time') else 0,
-    }
-    
+
+@app.route("/api/system_stats")
+def system_stats() -> Any:
+    jobs = list(_download_manager.list_jobs())
+    stats = _aggregate_stats(jobs)
+    stats["active_jobs"] = [_job_to_response(job) for job in jobs if job.status in {JobStatus.DOWNLOADING, JobStatus.PREPARING}]
     return jsonify(stats)
 
-@app.route('/api/clear_history', methods=['POST'])
-def clear_history():
-    """Clear download history"""
-    data = request.get_json()
-    download_id = data.get('download_id')
-    
+
+@app.route("/api/clear_history", methods=["POST"])
+def clear_history() -> Any:
+    payload = request.get_json(silent=True) or {}
+    download_id = payload.get("download_id") if isinstance(payload, dict) else None
+
     if download_id:
-        # Clear just one specific download
-        if download_id in session.get('downloads', []):
-            session['downloads'].remove(download_id)
-            
-            # Also remove from progress tracker if completed or error
-            if download_id in download_progress:
-                progress_obj = download_progress[download_id]
-                if progress_obj.completed or progress_obj.status == 'error':
-                    del download_progress[download_id]
-            
-            return jsonify({'message': f'Download {download_id} removed from history'})
-    else:
-        # Clear all completed or error downloads
-        if 'downloads' in session:
-            # Create a new list with only active downloads
-            active_downloads = []
-            for download_id in session['downloads']:
-                if download_id in download_progress:
-                    progress_obj = download_progress[download_id]
-                    if not (progress_obj.completed or progress_obj.status == 'error'):
-                        active_downloads.append(download_id)
-                    elif progress_obj.completed or progress_obj.status == 'error':
-                        # Clean up completed/error downloads from the progress tracker
-                        del download_progress[download_id]
-            
-            # Update session with only active downloads
-            session['downloads'] = active_downloads
-        
-        return jsonify({'message': 'Download history cleared'})
-    
-    return jsonify({'error': 'Invalid request'}), 400
+        downloads = _session_download_ids()
+        if download_id in downloads:
+            downloads.remove(download_id)
+            session["downloads"] = downloads
+            session.modified = True
+        job = _download_manager.get_job(download_id)
+        if job and job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
+            _download_manager.clear_job(download_id)
+        return jsonify({"message": f"Download {download_id} removed"})
 
-@app.route('/api/retry_download', methods=['POST'])
-def retry_download():
-    """Retry a failed download"""
-    data = request.get_json()
-    download_id = data.get('download_id')
-    
-    if not download_id:
-        return jsonify({'error': 'Download ID is required'}), 400
-    
-    if download_id not in download_progress:
-        return jsonify({'error': 'Download not found'}), 404
-    
-    progress_obj = download_progress[download_id]
-    
-    # Only retry if it's an error
-    if progress_obj.status != 'error':
-        return jsonify({'error': 'Can only retry failed downloads'}), 400
-    
-    # Reset progress
-    progress_obj.status = 'preparing'
-    progress_obj.progress = 0
-    progress_obj.downloaded = 0
-    progress_obj.error = None
-    progress_obj.completed = False
-    
-    # Get the original URL (need to store this in the progress object)
-    url = data.get('url')
-    if not url:
-        return jsonify({'error': 'URL is required for retry'}), 400
-    
-    # Start the download again
-    executor.submit(download_video, url, download_id, data.get('format', 'video'))
-    
-    return jsonify({'message': 'Download restarted', 'download_id': download_id})
+    session.pop("downloads", None)
+    session.modified = True
+    return jsonify({"message": "History cleared"})
 
-@app.route('/api/cancel_download', methods=['POST'])
-def cancel_download():
-    """Cancel an active download"""
-    data = request.get_json()
-    download_id = data.get('download_id')
-    
-    if not download_id:
-        return jsonify({'error': 'Download ID is required'}), 400
-    
-    if download_id not in download_progress:
-        return jsonify({'error': 'Download not found'}), 404
-    
-    progress_obj = download_progress[download_id]
-    
-    # Only cancel if it's not already completed or error
-    if progress_obj.status in ['completed', 'error']:
-        return jsonify({'error': 'Cannot cancel a completed or failed download'}), 400
-    
-    # Mark as cancelled
-    progress_obj.status = 'cancelled'
-    progress_obj.error = 'Download cancelled by user'
-    
-    thread = download_threads.get(download_id)
-    if thread and thread.is_alive():
-        # There is no safe way to kill a thread in Python, so we mark as cancelled
-        progress_obj.status = 'cancelled'
-        progress_obj.error = 'Download cancelled by user.'
-    
-    return jsonify({'message': 'Download cancelled', 'download_id': download_id})
 
-@app.route('/api/search_youtube', methods=['POST'])
-def search_youtube():
-    """Search YouTube videos using yt-dlp."""
-    data = request.get_json()
-    query = data.get('query')
-    limit = min(data.get('limit', 10), 30)  # Limit max results to 30
-    
-    if not query:
-        return jsonify({'error': 'Search query is required'}), 400
-    
+@app.route("/api/retry_download", methods=["POST"])
+def retry_download() -> Any:
+    payload = _require_json("download_id")
+    download_id = payload["download_id"]
+    job = _job_or_404(download_id)
+    if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
+        raise BadRequest("Only failed or cancelled downloads can be retried.")
+    new_job = _download_manager.retry_job(download_id)
+    if not new_job:
+        raise NotFound("Unable to retry download.")
+    return jsonify({"message": "Download restarted", "job": _job_to_response(new_job)})
+
+
+@app.route("/api/cancel_download", methods=["POST"])
+def cancel_download() -> Any:
+    payload = _require_json("download_id")
+    job = _job_or_404(payload["download_id"])
+    if job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
+        raise BadRequest("Download cannot be cancelled in its current state.")
+    _download_manager.cancel_job(payload["download_id"])
+    return jsonify({"message": "Download cancelled", "job": _job_to_response(job)})
+
+
+@app.route("/api/search_youtube", methods=["POST"])
+def search_youtube() -> Any:
+    payload = _require_json("query")
+    query = str(payload["query"]).strip()
+    limit = min(int(payload.get("limit", 10)), 30)
+    search_url = f"ytsearch{limit}:{query}"
+    options = {"quiet": True, "no_warnings": True, "extract_flat": True}
     try:
-        # Format the YouTube search URL
-        search_url = f"ytsearch{limit}:{query}"
-        
-        # Use yt-dlp to perform the search
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,  # Don't download the videos, just get info
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(options) as ydl:
             search_results = ydl.extract_info(search_url, download=False)
-            
-            # Process and format the results
-            videos = []
-            if 'entries' in search_results:
-                for entry in search_results['entries']:
-                    videos.append({
-                        'id': entry.get('id'),
-                        'title': entry.get('title'),
-                        'url': f"https://www.youtube.com/watch?v={entry.get('id')}",
-                        'thumbnail': entry.get('thumbnail'),
-                        'uploader': entry.get('uploader'),
-                        'duration': entry.get('duration'),
-                        'view_count': entry.get('view_count')
-                    })
-            
-            return jsonify({
-                'query': query,
-                'results': videos
-            })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    except Exception as exc:  # noqa: BLE001
+        raise BadRequest(str(exc)) from exc
 
-@app.route('/api/options')
-def get_options():
-    """Return available configuration options and current settings."""
-    options = {
-        'max_parallel_downloads': 5,
-        'speed_limit': os.environ.get('YDL_RATE_LIMIT', None),
-        'supported_formats': ['mp4', 'mp3', 'webm', 'm4a', 'wav', 'aac', 'flac'],
-        'default_download_folder': DOWNLOAD_FOLDER,
-        'history_export_formats': ['json', 'csv'],
-        'theme_modes': ['light', 'dark', 'auto'],
-        'max_batch_urls': 10
-    }
-    return jsonify(options)
+    videos = []
+    for entry in search_results.get("entries", []) or []:
+        videos.append(
+            {
+                "id": entry.get("id"),
+                "title": entry.get("title"),
+                "url": f"https://www.youtube.com/watch?v={entry.get('id')}" if entry.get("id") else None,
+                "thumbnail": entry.get("thumbnail"),
+                "uploader": entry.get("uploader"),
+                "duration": entry.get("duration"),
+                "view_count": entry.get("view_count"),
+            }
+        )
+    return jsonify({"query": query, "results": videos})
 
-# Set the app start time when the app is initialized
-app.start_time = time.time()
+
+@app.route("/api/options")
+def get_options() -> Any:
+    return jsonify(
+        {
+            "max_parallel_downloads": app.config["MAX_CONCURRENT_DOWNLOADS"],
+            "speed_limit": None,
+            "supported_formats": ["mp4", "mp3", "webm", "m4a", "wav", "aac", "flac"],
+            "default_download_folder": str(app.config["DOWNLOAD_ROOT"]),
+            "history_export_formats": ["json", "csv"],
+            "theme_modes": ["light", "dark", "auto"],
+            "max_batch_urls": 10,
+            "google_drive_enabled": HAS_GOOGLE_DRIVE,
+        }
+    )
+
 
 if __name__ == "__main__":
-    import sys
-    port = int(os.environ.get("PORT", 5000))
-    # Allow port override via command-line: python app.py 8080
-    if len(sys.argv) > 1:
-        try:
-            port = int(sys.argv[1])
-        except Exception:
-            pass
-    app.run(debug=True, host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(debug=bool(os.getenv("FLASK_DEBUG", "1")), host="0.0.0.0", port=port)

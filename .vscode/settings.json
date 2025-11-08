@@ -1,0 +1,6 @@
+{
+    "sonarlint.connectedMode.project": {
+        "connectionId": "amaroidev",
+        "projectKey": "amaroidev_All-Sites-Downloader"
+    }
+}
