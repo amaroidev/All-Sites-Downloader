@@ -135,7 +135,6 @@ class DownloadManager:
         self._rate_limit: Optional[int] = None
 
     def set_download_root(self, download_root: Path) -> Path:
-        """Update the base directory used for future downloads."""
 
         new_root = Path(download_root).expanduser().resolve()
         new_root.mkdir(parents=True, exist_ok=True)
@@ -147,7 +146,6 @@ class DownloadManager:
         self,
         job: DownloadJob,
     ) -> DownloadJob:
-        """Register and start a download job."""
         with self._lock:
             if job.job_id in self._jobs:
                 raise ValueError(f"Job {job.job_id} already exists")

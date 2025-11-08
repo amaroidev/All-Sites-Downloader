@@ -84,41 +84,54 @@ python app.py
 5. Click "Download" and wait for completion
 6. Download your file when ready
 
+git clone <your-repo-url>
+gunicorn --bind 0.0.0.0:5000 app:app
 ## 🌐 Deployment
 
-### Heroku Deployment
-1. Create a new Heroku app
-2. Connect your GitHub repository
-3. Add the following buildpacks:
-   - `heroku/python`
-4. Set environment variables:
-   - `FLASK_APP=app.py`
-5. Deploy from GitHub
+### Recommended: Docker (Render, Railway, Fly.io, VPS)
 
-### Railway Deployment
-1. Connect your GitHub repository to Railway
-2. Railway will auto-detect the Python app
-3. Deploy automatically
+1. Build the container locally and verify it runs:
+  ```bash
+  docker build -t all-sites-downloader .
+  docker run --rm -p 8000:8000 -e FLASK_SECRET_KEY=change-me -v $(pwd)/downloads:/app/downloads all-sites-downloader
+  ```
+2. Push the image to your registry of choice (GHCR, Docker Hub, Render private registry).
+3. Deploy the image on your platform and set environment variables:
+  - `FLASK_SECRET_KEY` – strong random value
+  - `DOWNLOAD_FOLDER` – override if you mount a different volume
+  - `MAX_DOWNLOADS`, `JOB_RETENTION_HOURS`, etc. (optional)
+4. Make sure the volume that backs `/app/downloads` (inside the container) is persistent.
 
-### DigitalOcean/VPS Deployment
+**Render example:**
+- Create a new Web Service → “Deploy an existing image from a registry”.
+- Point to the pushed image, set the start command to the default (`gunicorn app:app --bind 0.0.0.0:8000`).
+- Add a persistent disk and mount it at `/app/downloads`.
+
+**Railway/Fly.io example:**
+- Connect the GitHub repo and enable Docker deployment.
+- Add environment variables in the dashboard.
+- Configure a volume for `/app/downloads` (Fly) or a shared volume (Railway).
+
+### Running without Docker (classic VPS)
+
 ```bash
-# Install dependencies
 sudo apt update
-sudo apt install python3 python3-pip python3-venv nginx
+sudo apt install python3 python3-venv python3-pip ffmpeg nginx
 
-# Clone repository
-git clone <your-repo-url>
-cd universal-video-downloader
+git clone https://github.com/amaroidev/All-Sites-Downloader.git
+cd All-Sites-Downloader
 
-# Setup application
 python3 -m venv venv
 source venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
-pip install gunicorn
 
-# Run with Gunicorn
-gunicorn --bind 0.0.0.0:5000 app:app
+export FLASK_SECRET_KEY="change-me"
+export DOWNLOAD_FOLDER="/srv/all-sites-downloader"
+python app.py  # or gunicorn --bind 0.0.0.0:5000 app:app
 ```
+
+Reverse-proxy the process with Nginx or Caddy, add HTTPS, and run it under a process manager (Systemd, Supervisor, or pm2).
 
 ## 🔧 Configuration
 
@@ -135,7 +148,41 @@ app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 ```
 
-## 📋 Supported Platforms
+## � Release Automation
+
+The repository ships with `.github/workflows/release.yml`, which is triggered on demand or whenever a tag that starts with `v` (for example `v1.0.0`) is pushed.
+
+### Windows executable
+- The workflow runs PyInstaller on `windows-latest` and produces `dist/AllSitesDownloader.exe`.
+- The binary is zipped (`AllSitesDownloader-windows.zip`), uploaded as an artifact, and attached automatically to the GitHub Release created from the tag.
+- To build locally you can run:
+  ```powershell
+  pyinstaller app.py --name AllSitesDownloader --noconfirm --onefile ^
+    --add-data "templates;templates" ^
+    --add-data "static;static" ^
+    --add-data "browser-extension;browser-extension"
+  ```
+
+### Docker image QA
+- The workflow also performs a `docker build` on Ubuntu to ensure the container image stays healthy.
+- By default it does not push the image. If you want automated pushes, extend the workflow with registry login and set repository secrets for your token.
+
+### (Optional) Android wrapper
+For teams that want an APK, the quickest win is to wrap the hosted web app inside a WebView shell:
+1. Deploy the backend somewhere reachable over HTTPS.
+2. Use [Capacitor](https://capacitorjs.com/) or [Cordova](https://cordova.apache.org/) to scaffold a minimal container:
+   ```bash
+   npm init @capacitor/app android-shell
+   cd android-shell
+   npx cap init "Universal Downloader" "com.example.universaldl" --web-dir=www
+   ```
+3. Drop a single-page stub in `www/index.html` that loads `https://your-hosted-domain` inside an iframe/WebView.
+4. Configure network permissions and build the APK via Android Studio or `npx cap open android`.
+5. Sign the APK and attach it to the GitHub Release alongside the Windows zip.
+
+> Note: Kivy/BeeWare can deliver a fully offline Android client, but that path requires a bespoke mobile UI and is substantially more involved than a WebView wrapper.
+
+## �📋 Supported Platforms
 
 This downloader supports over 1000 websites including:
 
