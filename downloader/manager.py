@@ -60,10 +60,7 @@ class DownloadJob:
     updated_at: datetime = field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
     cancel_requested: bool = False
-
-    # Locks are not part of dataclass slots, so add manually post-init
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "_lock", threading.Lock())
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, object]:
         """Serialize the job for API responses."""
@@ -136,6 +133,15 @@ class DownloadManager:
         self._lock = threading.RLock()
         self._retention = timedelta(hours=retention_hours)
         self._rate_limit: Optional[int] = None
+
+    def set_download_root(self, download_root: Path) -> Path:
+        """Update the base directory used for future downloads."""
+
+        new_root = Path(download_root).expanduser().resolve()
+        new_root.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self._root = new_root
+        return new_root
 
     def start_download(
         self,

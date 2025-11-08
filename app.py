@@ -9,6 +9,8 @@ import os
 import subprocess
 import time
 import uuid
+from collections import OrderedDict
+from threading import RLock
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -35,6 +37,43 @@ LOG = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+class _TimedCache:
+    """Thread-safe TTL cache with simple LRU eviction."""
+
+    def __init__(self, ttl_seconds: float, max_entries: int) -> None:
+        self._ttl = float(ttl_seconds)
+        self._max_entries = max_entries
+        self._data: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
+        self._lock = RLock()
+
+    def get(self, key: str) -> Optional[Any]:
+        cutoff = time.time()
+        with self._lock:
+            entry = self._data.get(key)
+            if not entry:
+                return None
+            expires_at, value = entry
+            if expires_at < cutoff:
+                self._data.pop(key, None)
+                return None
+            self._data.move_to_end(key)
+            return value
+
+    def set(self, key: str, value: Any) -> None:
+        expires_at = time.time() + self._ttl
+        with self._lock:
+            self._data[key] = (expires_at, value)
+            self._data.move_to_end(key)
+            while len(self._data) > self._max_entries:
+                self._data.popitem(last=False)
+
+    def purge_expired(self) -> None:
+        cutoff = time.time()
+        with self._lock:
+            expired = [key for key, (expires_at, _) in self._data.items() if expires_at < cutoff]
+            for key in expired:
+                self._data.pop(key, None)
+
 
 def _configure_app(flask_app: Flask) -> None:
     """Populate default configuration from environment variables."""
@@ -48,9 +87,25 @@ def _configure_app(flask_app: Flask) -> None:
     session_dir.mkdir(parents=True, exist_ok=True)
     flask_app.config.setdefault("SESSION_FILE_DIR", str(session_dir))
 
-    download_root = Path(os.getenv("DOWNLOAD_FOLDER", Path.cwd() / "downloads")).resolve()
-    download_root.mkdir(parents=True, exist_ok=True)
+    download_env = os.getenv("DOWNLOAD_FOLDER")
+    download_root_selected = bool(download_env)
+    if download_env:
+        candidate = Path(download_env)
+    else:
+        candidate = Path.home() / "Downloads"
+
+    try:
+        download_root = candidate.expanduser().resolve()
+        download_root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        fallback = (Path.cwd() / "downloads").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        download_root = fallback
+        if download_env:
+            download_root_selected = True
+
     flask_app.config.setdefault("DOWNLOAD_ROOT", download_root)
+    flask_app.config.setdefault("DOWNLOAD_ROOT_SELECTED", download_root_selected)
 
     flask_app.config.setdefault("MAX_CONCURRENT_DOWNLOADS", int(os.getenv("MAX_DOWNLOADS", "4")))
     flask_app.config.setdefault("JOB_RETENTION_HOURS", int(os.getenv("JOB_RETENTION_HOURS", "24")))
@@ -71,6 +126,28 @@ _download_manager = DownloadManager(
 
 _cleanup_counter = {"value": 0}
 app.start_time = time.time()
+
+_video_info_cache = _TimedCache(ttl_seconds=600, max_entries=64)
+_search_cache = _TimedCache(ttl_seconds=300, max_entries=64)
+
+
+def _parse_duration(value: Any) -> Optional[int]:
+    """Convert yt-dlp duration field (seconds or timestamp string) to seconds."""
+
+    if isinstance(value, (int, float)):
+        if value < 0:
+            return None
+        return int(value)
+    if isinstance(value, str):
+        total = 0
+        parts = value.split(":")
+        try:
+            for part in parts:
+                total = total * 60 + int(part)
+        except ValueError:
+            return None
+        return total
+    return None
 
 
 def _require_json(*required_keys: str) -> Dict[str, Any]:
@@ -144,11 +221,44 @@ def _aggregate_stats(jobs: Iterable[DownloadJob]) -> Dict[str, Any]:
     }
 
 
+def _apply_download_root(path: Path) -> Path:
+    resolved = _download_manager.set_download_root(path)
+    app.config["DOWNLOAD_ROOT"] = resolved
+    app.config["DOWNLOAD_ROOT_SELECTED"] = True
+    return resolved
+
+
+def _open_directory_dialog() -> Optional[Path]:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("Folder selection dialog is not available on this system.") from exc
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        try:
+            root.attributes("-topmost", True)
+        except Exception:  # noqa: BLE001
+            pass
+        root.update_idletasks()
+        selected = filedialog.askdirectory(parent=root, title="Select download folder")
+    finally:
+        root.destroy()
+
+    if not selected:
+        return None
+    return Path(selected).expanduser()
+
+
 @app.before_request
 def _cleanup_downloads() -> None:
     _cleanup_counter["value"] += 1
     if _cleanup_counter["value"] % app.config["CLEANUP_EVERY_N_REQUESTS"] == 0:
         _download_manager.cleanup_expired()
+        _video_info_cache.purge_expired()
+        _search_cache.purge_expired()
 
 
 @app.route("/")
@@ -210,6 +320,45 @@ def download_file(download_id: str):
     )
 
 
+@app.route("/api/download_directory")
+def get_download_directory() -> Any:
+    current = Path(app.config["DOWNLOAD_ROOT"])
+    return jsonify(
+        {
+            "directory": str(current),
+            "user_selected": bool(app.config.get("DOWNLOAD_ROOT_SELECTED", False)),
+        }
+    )
+
+
+@app.route("/api/download_directory/select", methods=["POST"])
+def select_download_directory() -> Any:
+    payload = request.get_json(silent=True) or {}
+    manual_path = payload.get("path") if isinstance(payload, dict) else None
+
+    if manual_path:
+        path_str = str(manual_path).strip()
+        if not path_str:
+            return jsonify({"error": "Path cannot be empty."}), 400
+        candidate = Path(path_str).expanduser()
+    else:
+        try:
+            choice = _open_directory_dialog()
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc), "code": "dialog_unavailable"}), 501
+        if not choice:
+            return jsonify({"error": "No directory selected."}), 400
+        candidate = choice
+
+    try:
+        resolved = _apply_download_root(candidate)
+    except Exception as exc:  # noqa: BLE001
+        LOG.error("Failed to set download directory", exc_info=True)
+        return jsonify({"error": f"Could not use directory: {exc}"}), 400
+
+    return jsonify({"directory": str(resolved), "user_selected": True})
+
+
 @app.route("/api/supported_sites")
 def supported_sites() -> Any:
     cache_key = "supported_sites_cache"
@@ -260,7 +409,20 @@ def supported_sites() -> Any:
 def video_info() -> Any:
     payload = _require_json("url")
     url = str(payload["url"]).strip()
-    options = {"quiet": True, "skip_download": True}
+    cache_key = url
+    cached = _video_info_cache.get(cache_key)
+    if cached:
+        LOG.debug("video_info cache hit for %s", url)
+        return jsonify(cached)
+
+    started = time.time()
+    options = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": False,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+    }
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -286,20 +448,31 @@ def video_info() -> Any:
     for entry in info.get("entries", []) or []:
         entries.append({"title": entry.get("title"), "url": entry.get("webpage_url") or entry.get("url")})
 
-    return jsonify(
-        {
-            "title": info.get("title"),
-            "uploader": info.get("uploader"),
-            "duration": info.get("duration"),
-            "view_count": info.get("view_count"),
-            "description": info.get("description"),
-            "website": info.get("extractor_key"),
-            "thumbnail": info.get("thumbnail"),
-            "formats": formats,
-            "entries": entries,
-            "subtitles": info.get("subtitles", {}),
-        }
-    )
+    # Prefer https thumbnails when available
+    thumbnail = info.get("thumbnail")
+    if not thumbnail:
+        thumbs = info.get("thumbnails") or []
+        if thumbs:
+            thumbnail = thumbs[-1].get("url")
+    if isinstance(thumbnail, str) and thumbnail.startswith("http://"):
+        thumbnail = "https://" + thumbnail[len("http://"):]
+
+    response_payload = {
+        "title": info.get("title"),
+        "uploader": info.get("uploader"),
+        "duration": info.get("duration"),
+        "view_count": info.get("view_count"),
+        "description": info.get("description"),
+        "website": info.get("extractor_key"),
+        "thumbnail": thumbnail,
+        "formats": formats,
+        "entries": entries,
+        "subtitles": info.get("subtitles", {}),
+    }
+    _video_info_cache.set(cache_key, response_payload)
+    elapsed = time.time() - started
+    LOG.info("video_info fetched in %.2fs for %s", elapsed, url)
+    return jsonify(response_payload)
 
 
 @app.route("/api/my_downloads")
@@ -548,7 +721,21 @@ def search_youtube() -> Any:
     query = str(payload["query"]).strip()
     limit = min(int(payload.get("limit", 10)), 30)
     search_url = f"ytsearch{limit}:{query}"
-    options = {"quiet": True, "no_warnings": True, "extract_flat": True}
+    cache_key = f"{search_url}"
+    cached = _search_cache.get(cache_key)
+    if cached:
+        LOG.debug("search cache hit for %s", query)
+        return jsonify(cached)
+
+    started = time.time()
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "playlistend": limit,
+    }
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             search_results = ydl.extract_info(search_url, download=False)
@@ -557,18 +744,35 @@ def search_youtube() -> Any:
 
     videos = []
     for entry in search_results.get("entries", []) or []:
+        duration_value = _parse_duration(entry.get("duration")) or _parse_duration(entry.get("duration_string"))
+        view_count = entry.get("view_count")
+        if isinstance(view_count, str) and view_count.isdigit():
+            view_count = int(view_count)
+
+        thumbnail = entry.get("thumbnail")
+        if not thumbnail:
+            thumbs = entry.get("thumbnails") or []
+            if thumbs:
+                thumbnail = thumbs[-1].get("url")
+        if isinstance(thumbnail, str) and thumbnail.startswith("http://"):
+            thumbnail = "https://" + thumbnail[len("http://"):]
+
         videos.append(
             {
                 "id": entry.get("id"),
                 "title": entry.get("title"),
                 "url": f"https://www.youtube.com/watch?v={entry.get('id')}" if entry.get("id") else None,
-                "thumbnail": entry.get("thumbnail"),
+                "thumbnail": thumbnail,
                 "uploader": entry.get("uploader"),
-                "duration": entry.get("duration"),
-                "view_count": entry.get("view_count"),
+                "duration": duration_value,
+                "view_count": view_count,
             }
         )
-    return jsonify({"query": query, "results": videos})
+    payload = {"query": query, "results": videos}
+    _search_cache.set(cache_key, payload)
+    elapsed = time.time() - started
+    LOG.info("search_youtube fetched in %.2fs for %s", elapsed, query)
+    return jsonify(payload)
 
 
 @app.route("/api/options")
@@ -579,12 +783,39 @@ def get_options() -> Any:
             "speed_limit": None,
             "supported_formats": ["mp4", "mp3", "webm", "m4a", "wav", "aac", "flac"],
             "default_download_folder": str(app.config["DOWNLOAD_ROOT"]),
+            "download_folder_selected": bool(app.config.get("DOWNLOAD_ROOT_SELECTED", False)),
             "history_export_formats": ["json", "csv"],
             "theme_modes": ["light", "dark", "auto"],
             "max_batch_urls": 10,
             "google_drive_enabled": HAS_GOOGLE_DRIVE,
         }
     )
+
+
+@app.errorhandler(BadRequest)
+def handle_bad_request(error):
+    """Handle BadRequest exceptions and return JSON for API routes."""
+    if request.path.startswith('/api/'):
+        return jsonify({"error": str(error.description)}), error.code
+    return error
+
+
+@app.errorhandler(NotFound)
+def handle_not_found(error):
+    """Handle NotFound exceptions and return JSON for API routes."""
+    if request.path.startswith('/api/'):
+        return jsonify({"error": "Resource not found"}), error.code
+    return error
+
+
+@app.errorhandler(Exception)
+def handle_general_error(error):
+    """Handle general exceptions and return JSON for API routes."""
+    if request.path.startswith('/api/'):
+        LOG.exception("Unhandled API error")
+        return jsonify({"error": "Internal server error"}), 500
+    LOG.exception("Unhandled error")
+    return error
 
 
 if __name__ == "__main__":
